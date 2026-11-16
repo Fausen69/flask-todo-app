@@ -12,7 +12,7 @@ class Todo(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(255), nullable=False)
-    posted_on = db.Column(db.Date, default=date.utcnow)
+    posted_on = db.Column(db.Date, default=date.today)
     status = db.Column(db.Boolean(), default=False)
 
     def __init__(self, *args, **kwargs):
