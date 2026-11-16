@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from application.extensions import db
-from datetime import datetime
+from datetime import date
 
 __all__ = ['Todo']
 
@@ -12,7 +12,7 @@ class Todo(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(255), nullable=False)
-    posted_on = db.Column(db.Date, default=datetime.utcnow)
+    posted_on = db.Column(db.Date, default=date.utcnow)
     status = db.Column(db.Boolean(), default=False)
 
     def __init__(self, *args, **kwargs):
