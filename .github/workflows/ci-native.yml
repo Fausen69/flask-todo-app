@@ -1,0 +1,180 @@
+name: CI - Flask + SQLite (native Ubuntu)
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  APP_PORT: "7345"
+  FLASK_APP: "wsgi"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  ci:
+    name: Lint, init DB and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8
+          pip check
+          python -c "import flask, flask_sqlalchemy, sqlalchemy; print('Flask', flask.__version__, '| Flask-SQLAlchemy', flask_sqlalchemy.__version__, '| SQLAlchemy', sqlalchemy.__version__)"
+
+      - name: Validate code (flake8 + compileall)
+        run: |
+          set -euo pipefail
+          # только критические ошибки: синтаксис и неопределённые имена
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
+                   --exclude=.git,__pycache__,migrations,venv,.venv
+          # полный линт (стиль), длина строки ограничена 100 символами
+          flake8 . --count --max-line-length=100 --statistics \
+                   --exclude=.git,__pycache__,migrations,venv,.venv
+          python -m compileall -q application wsgi.py manage.py
+
+      - name: Initialize SQLite database
+        run: |
+          set -euo pipefail
+          rm -f todo.sqlite
+          flask --app "$FLASK_APP" db upgrade          # миграции Alembic из migrations/
+          flask --app "$FLASK_APP" init-db --seed      # идемпотентно: create_all + демо-запись
+          python - <<'PY'
+          import sqlite3
+          con = sqlite3.connect("todo.sqlite")
+          tables = [r[0] for r in con.execute(
+              "SELECT name FROM sqlite_master WHERE type='table'")]
+          print("tables:", tables)
+          assert "todo" in tables, "table 'todo' was not created"
+          cols = [r[1] for r in con.execute("PRAGMA table_info(todo)")]
+          print("columns:", cols)
+          assert cols == ["id", "title", "posted_on", "status"], cols
+          print("rows:", con.execute("SELECT COUNT(*) FROM todo").fetchone()[0])
+          print("DB INIT OK")
+          PY
+
+      - name: Start Flask server
+        run: |
+          set -euo pipefail
+          nohup gunicorn --bind "127.0.0.1:${APP_PORT}" \
+                         --workers 1 --threads 4 --timeout 30 \
+                         --access-logfile - --error-logfile - \
+                         wsgi:app > server.log 2>&1 &
+          echo $! > server.pid
+          echo "gunicorn PID: $(cat server.pid)"
+          for i in $(seq 1 30); do
+            if curl -sS -o /dev/null --max-time 3 "http://127.0.0.1:${APP_PORT}/"; then
+              echo "Server is up after ${i} attempt(s)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not start in 30 s" >&2
+          cat server.log >&2
+          exit 1
+
+      - name: Smoke test Flask server
+        run: |
+          set -euo pipefail
+          BASE_URL="http://127.0.0.1:${APP_PORT}"
+          SMOKE_TASK="ci-smoke-task-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "SMOKE_TASK=${SMOKE_TASK}" >> "$GITHUB_ENV"
+
+          echo "== 1. GET / =="
+          code=$(curl -sS -o page.html -w '%{http_code}' \
+                 --retry 5 --retry-connrefused --retry-delay 2 --max-time 10 "$BASE_URL/")
+          echo "HTTP ${code}"
+          test "$code" = "200"
+          grep -q "TODO Lists" page.html
+
+          echo "== 2. POST / (запись в SQLite) =="
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                 -X POST --data-urlencode "title=${SMOKE_TASK}" "$BASE_URL/")
+          echo "HTTP ${code}"
+          test "$code" = "302"
+
+          echo "== 3. GET / (задача сохранилась) =="
+          curl -fsS --max-time 10 "$BASE_URL/" -o page2.html
+          grep -q "$SMOKE_TASK" page2.html
+          echo "task '${SMOKE_TASK}' found in HTML"
+
+          echo "== 4. Статика и 404 =="
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/static/css/style.css")" = "200"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/no-such-page")" = "404"
+          echo "static -> 200, unknown page -> 404"
+
+          echo "SMOKE TEST PASSED"
+
+      - name: Verify data in SQLite
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sqlite3
+          task = os.environ["SMOKE_TASK"]
+          con = sqlite3.connect("todo.sqlite")
+          rows = con.execute("SELECT id, title, status FROM todo ORDER BY id").fetchall()
+          print("rows:", rows)
+          assert any(r[1] == task for r in rows), "smoke task is not in the database"
+          print("DB CHECK PASSED")
+          PY
+
+      - name: Stop Flask server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+            sleep 2
+          fi
+          echo "----- server.log -----"
+          cat server.log || true
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### CI: Flask + SQLite"
+            echo ""
+            echo "- Python: ${PYTHON_VERSION}"
+            echo "- URL: http://127.0.0.1:${APP_PORT}/"
+            echo "- Smoke task: ${SMOKE_TASK:-n/a}"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs and database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-and-db
+          path: |
+            server.log
+            todo.sqlite
+            page.html
+            page2.html
+          if-no-files-found: warn
+          retention-days: 7
